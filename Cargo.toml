@@ -1,0 +1,41 @@
+[package]
+name = "spconnect"
+version = "0.1.0"
+edition = "2024"
+description = "Unofficial Spotify source plugin (JSON-RPC over stdio): catalogue, sign-in, Ogg Vorbis stream relay and Spotify Connect remote control"
+license = "MIT"
+repository = "https://github.com/anon7627/spconnect"
+
+[dependencies]
+librespot-core = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-metadata = { version = "0.8", default-features = false }
+librespot-audio = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-protocol = "0.8"
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+uuid = { version = "1", features = ["v4"] }
+urlencoding = "2"
+aes = "0.8"
+ctr = "0.9"
+rand = "0.9"
+protobuf = "3"
+protobuf-json-mapping = "3"
+sha2 = "0.10"
+base64 = "0.22"
+http = "1"
+bytes = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
