@@ -43,6 +43,8 @@ struct Mock {
     revoked: HashSet<String>,
     /// `code_challenge` of the last authorisation URL, set by the test.
     challenge: Option<String>,
+    /// `product` of `/me`; `premium` when unset.
+    product: Option<String>,
 }
 
 type Shared = Arc<Mutex<Mock>>;
@@ -124,7 +126,10 @@ async fn mock(
     let not_found = || (StatusCode::NOT_FOUND, Json(json!({"error": {"status": 404, "message": "Resource not found"}}))).into_response();
     let m = method.as_str();
     let body = match (m, api) {
-        ("GET", "/me") => json!({"id": USER, "display_name": "Alice", "product": "premium", "email": "alice@example.org"}),
+        ("GET", "/me") => {
+            let product = mock.lock().unwrap().product.clone().unwrap_or_else(|| "premium".into());
+            json!({"id": USER, "display_name": "Alice", "product": product, "email": "alice@example.org"})
+        }
         ("GET", "/search") => {
             let types = q.get("type").cloned().unwrap_or_default();
             let mut v = json!({});
@@ -667,6 +672,61 @@ async fn revoked_sign_in_is_expired() {
         json!({"state": "expired", "account": {"display_name": "Alice", "detail": "Spotify Premium"}})
     );
     assert_eq!(host.err_code("browse.list", json!({"ref": "liked"})).await, -32001);
+    host.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn free_accounts_are_refused() {
+    let (base, mock) = start_mock().await;
+    mock.lock().unwrap().product = Some("free".into());
+    let dir = data_dir(None);
+    let mut host = Host::spawn(&base);
+    host.initialize(&dir, json!({})).await;
+    let creds_path = dir.join("credentials.json");
+
+    // By paste: the dialog shows why.
+    let begin = host.ok("auth.begin", json!({})).await;
+    let url = begin["url"].as_str().unwrap().to_string();
+    mock.lock().unwrap().challenge = Some(query_of(&url, "code_challenge"));
+    let landed = format!("{}?code={CODE}&state={}", query_of(&url, "redirect_uri"), query_of(&url, "state"));
+    let refused = host.error("auth.complete", json!({"input": landed})).await;
+    assert_eq!(refused["code"], -32602);
+    assert_eq!(
+        refused["message"],
+        "Les comptes Spotify Free ne sont pas pris en charge : la lecture demande un abonnement Spotify Premium."
+    );
+    assert!(!creds_path.exists());
+    assert_eq!(host.ok("auth.status", json!({})).await, json!({"state": "signed_out"}));
+
+    // Through the loopback redirect: the browser page says why.
+    let begin = host.ok("auth.begin", json!({})).await;
+    let url = begin["url"].as_str().unwrap().to_string();
+    mock.lock().unwrap().challenge = Some(query_of(&url, "code_challenge"));
+    let redirect = query_of(&url, "redirect_uri");
+    let page = reqwest::get(format!("{redirect}?code={CODE}&state={}", query_of(&url, "state"))).await.unwrap().text().await.unwrap();
+    assert!(page.contains("Spotify Free"), "{page}");
+    assert!(!creds_path.exists());
+
+    host.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn stored_free_account_is_signed_out() {
+    let (base, mock) = start_mock().await;
+    mock.lock().unwrap().product = Some("free".into());
+    // Credentials saved without the subscription, as older versions did.
+    let dir = data_dir(Some(REFRESH));
+    let creds_path = dir.join("credentials.json");
+    let mut creds: Value = serde_json::from_str(&std::fs::read_to_string(&creds_path).unwrap()).unwrap();
+    creds.as_object_mut().unwrap().remove("product");
+    std::fs::write(&creds_path, creds.to_string()).unwrap();
+
+    let mut host = Host::spawn(&base);
+    host.initialize(&dir, json!({})).await;
+    assert_eq!(host.ok("auth.status", json!({})).await, json!({"state": "signed_out"}));
+    assert!(!creds_path.exists());
     host.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

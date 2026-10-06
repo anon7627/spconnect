@@ -110,8 +110,9 @@ says.
 - **The device does not show up in the apps**: look for `Spotify Connect:
   device announced` in the log, and check the "Show the player in Spotify
   Connect" setting. The apps must be signed in to the same account.
-- **`a Premium account is required`**: Spotify refuses sessions of free
-  accounts to third-party clients.
+- **"Spotify Free accounts are not supported"** at sign-in: playback
+  through librespot needs Spotify Premium. The account is checked before
+  any session is opened, and signed out if it is not Premium.
 - **`stored credentials refused`, the player shows the account as expired**:
   sign in again.
 
@@ -146,4 +147,5 @@ resolves the track, downloads it through the relay and writes the Ogg file
 | `audiokey.rs` | Audio keys, retried |
 | `connect/` | Spotify Connect device: dealer commands → `player.*`, `player.state` → connect-state |
 | `session.rs` | OAuth (PKCE, loopback redirect), stored credentials, librespot session, Web API tokens |
+| `probe.rs` | First connection in a child process: free accounts are refused without ending the plugin |
 | `webapi.rs` | Web API client: token renewal, rate limits |

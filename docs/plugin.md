@@ -61,9 +61,9 @@ apply without restarting the plugin (`settings.changed`).
 
 | Method | Implementation |
 |---|---|
-| `auth.status` | `credentials.json`, then `GET /me`: `signed_in`; `expired` when Spotify refuses the credentials or the refresh token; `signed_out` without credentials. A network failure keeps `signed_in`. |
+| `auth.status` | `credentials.json`, then `GET /me`: `signed_in`; `expired` when Spotify refuses the credentials or the refresh token; `signed_out` without credentials, or for an account found not to be Premium (its credentials are deleted). A network failure keeps `signed_in`. |
 | `auth.begin` | OAuth authorisation code with PKCE (S256), client id of librespot's desktop client, redirect `http://127.0.0.1:<port>/login` on a free port, a random `state`. Answers `expects_input: true`. The loopback listener waits 15 minutes; a redirect whose `state` matches completes the sign-in and sends `auth.changed`. |
-| `auth.complete` | Takes the code from the pasted address (or the bare code), trades it for tokens at `/api/token` with the PKCE verifier, opens a session with the access token, and stores the reusable credentials the session hands out |
+| `auth.complete` | Takes the code from the pasted address (or the bare code), trades it for tokens at `/api/token` with the PKCE verifier, runs the [account check](#premium-accounts-only) with the access token, and stores the reusable credentials it hands out. A free account gets `-32602` with "Spotify Free accounts are not supported…", in the host's language |
 | `auth.sign_out` | Closes the session, leaves Spotify Connect, deletes `credentials.json` |
 
 `credentials.json` (mode 600) holds the session's reusable credentials
@@ -71,6 +71,27 @@ apply without restarting the plugin (`settings.changed`).
 access point refreshes the former as sessions open; the latter is a
 fallback for the Web API. When a request is refused for authentication
 mid-session, the plugin sends `auth.changed {state: "expired"}` once.
+
+The page the loopback redirect lands on waits for the sign-in to finish
+and says how it ended, including why a free account was refused.
+
+### Premium accounts only
+
+librespot refuses accounts that are not Premium by ending the whole
+process (`exit(1)`) as soon as the access point gives the account type.
+The plugin therefore never opens a session for an account it has not seen
+through:
+
+- The first connection is made by a child process, `spconnect
+  account-check`, which reads the credentials on stdin, connects, and
+  prints the reusable credentials and the account type. Its stderr is
+  discarded (librespot logs the account name). If it dies with status 1,
+  the account is not Premium.
+- The account type is stored in `credentials.json` (`product`). Sessions
+  are opened only for `premium`; credentials without a known type (saved
+  by 0.1.0) go through the child first.
+- A free account is signed out at the next `auth.status`, and Spotify
+  Connect is not joined.
 
 ## Tokens and the Web API (`webapi.rs`)
 

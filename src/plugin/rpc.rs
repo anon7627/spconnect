@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::session::SignedOut;
+use crate::session::{PremiumRequired, SignedOut};
 use crate::webapi::HttpError;
 
 pub const PARSE_ERROR: i64 = -32700;
@@ -79,6 +79,9 @@ impl From<anyhow::Error> for RpcError {
         let message = format!("{e:#}");
         if e.chain().any(|c| c.downcast_ref::<SignedOut>().is_some()) {
             return Self::new(AUTH_REQUIRED, message);
+        }
+        if let Some(p) = e.chain().find_map(|c| c.downcast_ref::<PremiumRequired>()) {
+            return Self::new(UNAVAILABLE, p.to_string());
         }
         if let Some(h) = e.chain().find_map(|c| c.downcast_ref::<HttpError>()) {
             return match h.status {

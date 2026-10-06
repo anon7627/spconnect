@@ -27,7 +27,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio::task::AbortHandle;
 
 use crate::connect::{self, HostEvent, HostState};
-use crate::session::{self, Account, Pkce, SignedOut};
+use crate::session::{self, Account, Pkce, PremiumRequired, SignedOut};
 use crate::webapi::{HttpError, WebApi};
 use resolve::Output;
 use rpc::{AUTH_REQUIRED, Incoming, Out, RpcError, RpcResult};
@@ -241,7 +241,11 @@ impl Plugin {
         if p.protocol.is_some_and(|v| v != PROTOCOL) {
             tracing::warn!("host speaks protocol {:?}, this plugin v{PROTOCOL}", p.protocol);
         }
-        let opts = session::Options { accounts_base: self.opts.accounts_base.clone(), no_session: self.opts.no_session };
+        let opts = session::Options {
+            accounts_base: self.opts.accounts_base.clone(),
+            api_base: self.opts.api_base.clone(),
+            no_session: self.opts.no_session,
+        };
         let account = Arc::new(Account::new(p.data_dir.clone(), &opts).map_err(RpcError::from)?);
         let signed_in = account.signed_in();
         *self.account.lock().unwrap_or_else(|e| e.into_inner()) = Some(account);
@@ -502,6 +506,14 @@ impl Plugin {
             Some(Err(e)) => tracing::info!("profile not read: {e:#}"),
             None => {}
         }
+        if account.stored().and_then(|s| s.product).is_some_and(|p| !session::is_premium(&p)) {
+            // Signed in before this check existed: a free account cannot
+            // play, so it is signed out and the next sign-in says why.
+            tracing::info!("not a Premium account: signed out");
+            self.stop_connect();
+            account.sign_out().await.map_err(RpcError::from)?;
+            return Ok(json!({"state": "signed_out"}));
+        }
         Ok(json!({"state": "signed_in", "account": self.account_json(&account)}))
     }
 
@@ -521,10 +533,16 @@ impl Plugin {
                 let server_handle = server.clone();
                 let (r, verifier) = (redirect.clone(), pkce.verifier.clone());
                 let waiter = tokio::spawn(async move {
-                    if let Ok(Some(code)) = tokio::time::timeout(LOGIN_WAIT, code_rx.recv()).await {
+                    if let Ok(Some((code, outcome))) = tokio::time::timeout(LOGIN_WAIT, code_rx.recv()).await {
                         match me.sign_in(&code, &r, &verifier).await {
-                            Ok(status) => me.out.notify("auth.changed", status),
-                            Err(e) => tracing::warn!("sign-in through the loopback redirect failed: {}", e.message),
+                            Ok(status) => {
+                                me.out.notify("auth.changed", status);
+                                let _ = outcome.send(Ok(()));
+                            }
+                            Err(e) => {
+                                tracing::warn!("sign-in through the loopback redirect failed: {}", e.message);
+                                let _ = outcome.send(Err(e.message));
+                            }
                         }
                     }
                     server_handle.abort();
@@ -550,7 +568,11 @@ impl Plugin {
             if e.chain().any(|c| c.is::<session::Refused>()) { RpcError::invalid_params(format!("{e:#}")) } else { RpcError::from(e) }
         })?;
         self.stop_connect();
-        account.sign_in(token, None).await.map_err(RpcError::from)?;
+        account.sign_in(token, None).await.map_err(|e| match e.downcast_ref::<PremiumRequired>() {
+            // Shown as is in the sign-in dialog.
+            Some(p) => RpcError::invalid_params(p.to_string()),
+            None => RpcError::from(e),
+        })?;
         self.state().expiry_notified = false;
         catalog::forget_probes();
         catalog::forget_cursors();
@@ -583,6 +605,10 @@ impl Plugin {
                     Ok(s) => s,
                     Err(e) if e.chain().any(|c| c.is::<SignedOut>()) => {
                         tracing::info!("Spotify Connect: signed out");
+                        return;
+                    }
+                    Err(e) if e.chain().any(|c| c.is::<PremiumRequired>()) => {
+                        tracing::info!("Spotify Connect: not a Premium account");
                         return;
                     }
                     Err(e) => {

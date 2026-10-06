@@ -14,7 +14,8 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use librespot_core::authentication::Credentials;
 use librespot_core::{Session, SessionConfig};
-use librespot_protocol::authentication::AuthenticationType;
+
+use crate::probe;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,6 +52,28 @@ const RECONNECT_GAP: Duration = Duration::from_secs(5);
 /// No stored credentials, or Spotify refused them: sign in again.
 #[derive(Debug)]
 pub struct SignedOut;
+
+/// The account is not Premium. librespot refuses such accounts, and ends
+/// the whole process when an access point says so: the subscription is
+/// checked through the Web API before any session is opened.
+#[derive(Debug)]
+pub struct PremiumRequired;
+
+impl std::fmt::Display for PremiumRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::plugin::items::tr(
+            "Spotify Free accounts are not supported: playback needs a Spotify Premium subscription.",
+            "Les comptes Spotify Free ne sont pas pris en charge : la lecture demande un abonnement Spotify Premium.",
+        ))
+    }
+}
+
+impl std::error::Error for PremiumRequired {}
+
+/// `product` of `/me`, or the access point's account `type`.
+pub fn is_premium(product: &str) -> bool {
+    product == "premium"
+}
 
 impl std::fmt::Display for SignedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -287,6 +310,8 @@ pub fn device_id(data_dir: &Path) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     pub accounts_base: Option<String>,
+    /// Web API root, for the subscription check.
+    pub api_base: Option<String>,
     /// Web API only (tests): no access point, no audio.
     pub no_session: bool,
 }
@@ -300,6 +325,7 @@ struct OAuthToken {
 pub struct Account {
     data_dir: PathBuf,
     accounts_base: String,
+    api_base: String,
     no_session: bool,
     device_id: String,
     pub http: reqwest::Client,
@@ -316,6 +342,7 @@ impl Account {
             device_id: device_id(&data_dir),
             data_dir,
             accounts_base: opts.accounts_base.clone().unwrap_or_else(|| ACCOUNTS_BASE.into()),
+            api_base: opts.api_base.clone().unwrap_or_else(|| crate::webapi::API_BASE.into()).trim_end_matches('/').to_string(),
             no_session: opts.no_session,
             http: reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?,
             stored: Mutex::new(stored),
@@ -382,15 +409,19 @@ impl Account {
         }
         let mut stored = Stored { refresh_token: token.refresh_token.clone(), ..Default::default() };
         if !self.no_session {
-            let session = self.new_session();
-            session.connect(Credentials::with_access_token(&token.access_token), false).await.map_err(login_error)?;
-            stored.username = session.username();
-            stored.auth_type = AuthenticationType::AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS as i32;
-            stored.auth_data = STANDARD.encode(session.auth_data());
-            stored.product = session.get_user_attribute("type");
-            *self.last_connect.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-            *self.session.lock().await = Some(session);
+            // A first connection in a child process: see `probe`.
+            let checked = probe::check(&self.device_id, &Credentials::with_access_token(&token.access_token)).await?;
+            stored.username = checked.username;
+            stored.auth_type = checked.auth_type;
+            stored.auth_data = checked.auth_data;
+            stored.product = checked.product;
         } else {
+            // Web API only (tests): the subscription comes from `/me`.
+            let product = self.product_of(&token.access_token).await.context("cannot check the Spotify subscription")?;
+            if product.as_deref().is_some_and(|p| !is_premium(p)) {
+                return Err(PremiumRequired.into());
+            }
+            stored.product = product;
             stored.username = username_hint.unwrap_or_else(|| "account".into());
         }
         if stored.username.is_empty() {
@@ -420,6 +451,7 @@ impl Account {
         }
         let stored = self.stored().ok_or(SignedOut)?;
         let creds = stored.credentials().ok_or(SignedOut)?;
+        let stored = self.check_premium(stored, &creds).await?;
         let wait = {
             let last = self.last_connect.lock().unwrap_or_else(|e| e.into_inner());
             last.and_then(|t| RECONNECT_GAP.checked_sub(t.elapsed()))
@@ -444,6 +476,41 @@ impl Account {
         }
         *guard = Some(session.clone());
         Ok(session)
+    }
+
+    /// Refuse to open a session for an account that is not Premium: librespot
+    /// would end the plugin. Credentials whose subscription is not known yet
+    /// (saved by older versions) go through [`probe::check`] first.
+    async fn check_premium(&self, stored: Stored, creds: &Credentials) -> Result<Stored> {
+        match stored.product.as_deref() {
+            Some(p) if is_premium(p) => Ok(stored),
+            Some(_) => Err(PremiumRequired.into()),
+            None => {
+                let checked = match probe::check(&self.device_id, creds).await {
+                    Err(e) if e.chain().any(|c| c.is::<PremiumRequired>()) => {
+                        self.note_profile(None, Some("free"));
+                        return Err(e);
+                    }
+                    r => r?,
+                };
+                let mut s = stored;
+                s.product = checked.product;
+                self.set_stored(Some(s.clone()))?;
+                Ok(s)
+            }
+        }
+    }
+
+    /// `product` of `GET /me` with `token`: `premium`, `free`… `None` when
+    /// the answer does not say.
+    async fn product_of(&self, token: &str) -> Result<Option<String>> {
+        let r = self.http.get(format!("{}/me", self.api_base)).bearer_auth(token).send().await?;
+        let status = r.status();
+        if !status.is_success() {
+            bail!("GET /me: HTTP {}", status.as_u16());
+        }
+        let v: serde_json::Value = r.json().await?;
+        Ok(v.get("product").and_then(|p| p.as_str()).filter(|p| !p.is_empty()).map(str::to_string))
     }
 
     /// Close `session` if it is still the current one: the next call to
@@ -531,7 +598,7 @@ fn login_error(e: librespot_core::Error) -> anyhow::Error {
     let refused = matches!(e.kind, ErrorKind::PermissionDenied | ErrorKind::Unauthenticated);
     let premium = format!("{e}").contains("Premium");
     if premium {
-        return anyhow!("Spotify refused the session: a Premium account is required ({e})");
+        return PremiumRequired.into();
     }
     if refused {
         return anyhow::Error::from(SignedOut).context(format!("Spotify refused the stored credentials: {e}"));
@@ -539,29 +606,43 @@ fn login_error(e: librespot_core::Error) -> anyhow::Error {
     anyhow::Error::from(e).context("connecting to Spotify")
 }
 
+/// A code caught by the loopback redirect, and where to send the outcome
+/// of the sign-in it starts (`Err`: the message to show).
+pub type CallbackCode = (String, tokio::sync::oneshot::Sender<Result<(), String>>);
+
+/// How long the browser page waits for the sign-in to finish.
+const CALLBACK_WAIT: Duration = Duration::from_secs(30);
+
 /// Serve the loopback redirect of a sign-in: `GET /login?code=…&state=…`.
-/// Each code whose state matches goes to `codes`.
+/// Each code whose state matches goes to `codes`; the page then shows how
+/// the sign-in ended.
 pub fn serve_callback(
     listener: tokio::net::TcpListener,
     state: String,
-    codes: tokio::sync::mpsc::UnboundedSender<String>,
+    codes: tokio::sync::mpsc::UnboundedSender<CallbackCode>,
 ) -> tokio::task::JoinHandle<()> {
     use axum::extract::{Query, State};
     use axum::response::Html;
     use axum::routing::get;
-    type Shared = (String, tokio::sync::mpsc::UnboundedSender<String>);
+    type Shared = (String, tokio::sync::mpsc::UnboundedSender<CallbackCode>);
 
     async fn login(
         State(shared): State<std::sync::Arc<Shared>>,
         Query(q): Query<std::collections::HashMap<String, String>>,
-    ) -> Html<&'static str> {
+    ) -> Html<String> {
         let (state, codes) = &*shared;
-        match (q.get("code"), q.get("state")) {
-            (Some(code), Some(s)) if s == state => {
-                let _ = codes.send(code.clone());
-                Html(PAGE_DONE)
-            }
-            _ => Html(PAGE_FAILED),
+        let (Some(code), Some(s)) = (q.get("code"), q.get("state")) else { return Html(page(PAGE_FAILED)) };
+        if s != state {
+            return Html(page(PAGE_FAILED));
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if codes.send((code.clone(), tx)).is_err() {
+            return Html(page(PAGE_FAILED));
+        }
+        match tokio::time::timeout(CALLBACK_WAIT, rx).await {
+            Ok(Ok(Ok(()))) => Html(page(PAGE_DONE)),
+            Ok(Ok(Err(message))) => Html(page(&message)),
+            _ => Html(page(PAGE_FAILED)),
         }
     }
 
@@ -573,14 +654,19 @@ pub fn serve_callback(
     })
 }
 
-const PAGE_DONE: &str = "<!doctype html><meta charset=utf-8><title>Spotify</title>\
-    <p>Signed in. You can close this page and go back to the player.</p>";
-const PAGE_FAILED: &str = "<!doctype html><meta charset=utf-8><title>Spotify</title>\
-    <p>Sign-in did not complete. Start it again from the player.</p>";
+const PAGE_DONE: &str = "Signed in. You can close this page and go back to the player.";
+const PAGE_FAILED: &str = "Sign-in did not complete. Start it again from the player.";
+
+/// The browser page, with `message` as plain text.
+fn page(message: &str) -> String {
+    let escaped = message.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!("<!doctype html><meta charset=utf-8><title>Spotify</title><p>{escaped}</p>")
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use librespot_protocol::authentication::AuthenticationType;
 
     #[test]
     fn pkce_challenge_matches_rfc_7636() {

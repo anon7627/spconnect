@@ -1,6 +1,7 @@
 mod audiokey;
 mod connect;
 mod plugin;
+mod probe;
 mod session;
 mod webapi;
 
@@ -32,6 +33,9 @@ enum Command {
         #[arg(long, hide = true)]
         no_session: bool,
     },
+    /// Connect once and print the account type (run by the plugin itself).
+    #[command(name = "account-check", hide = true)]
+    AccountCheck,
 }
 
 /// librespot logs the account name at sign-in, and tokens at trace level:
@@ -55,7 +59,10 @@ fn log_filter() -> EnvFilter {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let Command::Plugin { api_base, accounts_base, no_session } = Cli::parse().command;
+    let Command::Plugin { api_base, accounts_base, no_session } = Cli::parse().command else {
+        // No log: librespot names the account in it.
+        probe::run().await
+    };
     // stdout carries the protocol; the host copies stderr to its log.
     tracing_subscriber::fmt().with_env_filter(log_filter()).with_writer(std::io::stderr).with_ansi(false).init();
     plugin::run(plugin::Options { api_base, accounts_base, no_session }).await
